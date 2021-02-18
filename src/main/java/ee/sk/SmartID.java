@@ -2,7 +2,7 @@ package ee.sk;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import ee.sk.smartid.*;
-import ee.sk.smartid.rest.dao.NationalIdentity;
+import ee.sk.smartid.rest.dao.SemanticsIdentifier;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
@@ -11,11 +11,12 @@ import java.io.*;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.security.cert.CertificateEncodingException;
 import java.util.HashMap;
 import java.util.Map;
 
-import javax.servlet.RequestDispatcher;
 import javax.servlet.ServletException;
 import javax.servlet.annotation.MultipartConfig;
 import javax.servlet.annotation.WebServlet;
@@ -32,6 +33,10 @@ import static java.util.stream.Collectors.joining;
         maxFileSize = 1024 * 1024 * 5,
         maxRequestSize = 1024 * 1024 * 5 * 5)
 public class SmartID extends HttpServlet {
+    static private final String RPURL = "https://sid.demo.sk.ee/smart-id-rp/v2/";
+    static private final String RPUUID = "00000000-0000-0000-0000-000000000000";
+    static private final String RPNAME = "DEMO";
+    static private final String RPLEVEL = "QUALIFIED";
     static private final String API_SERVER = "https://eidas-demo.eparaksts.lv/trustedx-authserver/oauth/lvrtc-eipsign-as/token";
     static private final String SIGNAPI_SERVER = "https://signapi-prep.eparaksts.lv/";
     static private final String CLIENT_ID = "";
@@ -43,8 +48,8 @@ public class SmartID extends HttpServlet {
     }};
     static private final ObjectMapper objectMapper = new ObjectMapper();
 
-    static public void main(String args[]) throws IOException, CertificateEncodingException {
-        sign(args[0], "test.txt", "123".getBytes());
+    static public void main(String[] args) throws IOException, CertificateEncodingException {
+        Files.write(Paths.get("test.edoc"), sign(args[0], "test.txt", "123".getBytes()));
     }
 
     @Override
@@ -64,7 +69,7 @@ public class SmartID extends HttpServlet {
         }
     }
 
-    static void sign(String id, String fileName, byte[] data) throws IOException, CertificateEncodingException {
+    static byte[] sign(String id, String fileName, byte[] data) throws IOException, CertificateEncodingException {
         String url = API_SERVER + "?" + TOKEN_PARAMS.entrySet().stream().map(Object::toString).collect(joining("&"));
         Token token = send(url, "POST", new HashMap<String, String>() {{
             put("Authorization", "Basic " + toBase64(CLIENT_ID + ":" + CLIENT_SECRET));
@@ -75,22 +80,22 @@ public class SmartID extends HttpServlet {
         }};
 
         Session session = send(SIGNAPI_SERVER + "api-session/v1.0/start", "GET", headers, Session.class, null);
-        File file = sendFile(SIGNAPI_SERVER + "api-storage/v1.0/" + session.data.sessionId + "/upload", headers, File.class, fileName, data);
+        File file = sendFile(SIGNAPI_SERVER + "api-storage/v1.0/" + session.data.sessionId + "/upload", headers, fileName, data);
 
         SmartIdClient client = new SmartIdClient();
-        client.setRelyingPartyUUID("00000000-0000-0000-0000-000000000000");
-        client.setRelyingPartyName("DEMO");
-        client.setHostUrl("https://sid.demo.sk.ee/smart-id-rp/v1/");
+        client.setRelyingPartyUUID(RPUUID);
+        client.setRelyingPartyName(RPNAME);
+        client.setHostUrl(RPURL);
 
         SmartIdCertificate certificateResponse = client
             .getCertificate()
-            .withNationalIdentity(new NationalIdentity("EE", id))
-            .withCertificateLevel("QUALIFIED")
+            .withSemanticsIdentifier(new SemanticsIdentifier(SemanticsIdentifier.IdentityType.PNO, SemanticsIdentifier.CountryCode.EE, id))
+            .withCertificateLevel(RPLEVEL)
             .fetch();
 
         DigestRequest digestRequest = new DigestRequest(new SessionID[] {new SessionID(session.data.sessionId)},
                 toBase64(certificateResponse.getCertificate().getEncoded()), false, false);
-        Digest digest = sendJson(SIGNAPI_SERVER + "api-sign/v1.0/calculateDigest", "POST", headers, Digest.class, digestRequest);
+        Digest digest = sendJson(SIGNAPI_SERVER + "api-sign/v1.0/calculateDigest", headers, Digest.class, digestRequest);
 
         SignableHash hashToSign = new SignableHash();
         hashToSign.setHashType(HashType.SHA256);
@@ -101,14 +106,18 @@ public class SmartID extends HttpServlet {
                 .createSignature()
                 .withDocumentNumber(certificateResponse.getDocumentNumber())
                 .withSignableHash(hashToSign)
-                .withCertificateLevel("QUALIFIED")
+                .withCertificateLevel(RPLEVEL)
                 .sign();
 
         FinalizeSignatureRequest finalizeSignatureRequest = new FinalizeSignatureRequest(new FinalizeSignatureRequest.SignatureValue[]{
                 new FinalizeSignatureRequest.SignatureValue(session.data.sessionId, smartIdSignature.getValueInBase64())}, AUTHCERT);
-        FinalizeSignature finalizeSignature = sendJson(SIGNAPI_SERVER + "api-sign/v1.0/finalizeSigning", "POST", headers, FinalizeSignature.class, finalizeSignatureRequest);
+        FinalizeSignature finalizeSignature = sendJson(SIGNAPI_SERVER + "api-sign/v1.0/finalizeSigning", headers, FinalizeSignature.class, finalizeSignatureRequest);
+
+        FileList list = send(SIGNAPI_SERVER + "api-storage/v1.0/" + session.data.sessionId + "/list", "GET", headers, FileList.class, null);
+        byte[] container = send(SIGNAPI_SERVER + "api-storage/v1.0/" + session.data.sessionId + "/" + list.data[0].id, "GET", headers, byte[].class, null);
 
         send(SIGNAPI_SERVER + "api-session/v1.0/" + session.data.sessionId + "/close", "GET", headers, null, null);
+        return container;
     }
 
     interface Body {
@@ -128,13 +137,25 @@ public class SmartID extends HttpServlet {
         if (valueType == null) {
             return null;
         }
+        if (valueType.isArray()) {
+            try (InputStream is = conn.getInputStream()) {
+                ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+                int nRead;
+                byte[] data = new byte[16384];
+                while ((nRead = is.read(data, 0, data.length)) != -1) {
+                    buffer.write(data, 0, nRead);
+                }
+
+                return (T) buffer.toByteArray();
+            }
+        }
         T value = objectMapper.readValue(conn.getInputStream(), valueType);
         System.out.println(value);
         return value;
     }
 
-    private static <T> T sendJson(String url, String method, Map<String, String> headers, Class<T> valueType, Object request) throws IOException {
-        return send(url, method, headers, valueType, conn -> {
+    private static <T> T sendJson(String url, Map<String, String> headers, Class<T> valueType, Object request) throws IOException {
+        return send(url, "POST", headers, valueType, conn -> {
             if (request != null) {
                 conn.setRequestProperty("Content-Type", "application/json");
                 conn.setDoOutput(true);
@@ -144,8 +165,8 @@ public class SmartID extends HttpServlet {
         });
     }
 
-    private static <T> T sendFile(String url, Map<String, String> headers, Class<T> valueType, String filename, byte[] data) throws IOException {
-        return send(url, "PUT", headers, valueType, conn -> {
+    private static File sendFile(String url, Map<String, String> headers, String filename, byte[] data) throws IOException {
+        return send(url, "PUT", headers, File.class, conn -> {
             final String boundary = "------------------------" + Long.toHexString(System.currentTimeMillis());
             conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary);
             conn.setDoOutput(true);
@@ -186,12 +207,6 @@ public class SmartID extends HttpServlet {
         String code;
         String message;
         Error[] details;
-    }
-
-    @Data
-    private static class Response<T> {
-        Error error;
-        T data;
     }
 
     @Data
@@ -265,11 +280,32 @@ public class SmartID extends HttpServlet {
     private static class FinalizeSignature
     {
         @Data
-        static private class Result
+        private static class Result
         {
-            SessionID results;
+            SessionID[] results;
         }
         Result data;
         Error error;
+    }
+
+    @Data
+    private static class FileList
+    {
+        @Data
+        private static class FileInfo {
+            @Data
+            private static class Metadata {
+                String id;
+                String name;
+                Integer size;
+                String type;
+            }
+            String id;
+            String name;
+            Integer size;
+            String type;
+            Metadata[] includedDocuments;
+        }
+        FileInfo[] data;
     }
 }
